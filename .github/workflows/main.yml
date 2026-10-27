@@ -26,6 +26,8 @@ jobs:
       BUILD_HOST: armeabi-v7a
       BUILD_GUEST: arm-softmmu
       USE_QEMU_VERSION: "5.1.0"
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
       - name: Checkout Scorp project
@@ -40,32 +42,68 @@ jobs:
             autoconf automake libtool pkg-config \
             flex bison gettext python3 \
             binutils patch perl file \
-            openjdk-17-jdk openjdk-11-jdk
+            openjdk-11-jdk openjdk-17-jdk
 
-      - name: Configure Java for Android SDK
+      - name: Configure Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK and NDK
+      - name: Locate existing Android SDK
+        shell: bash
         run: |
-          sdkmanager --install \
+          set -e
+
+          test -d "$ANDROID_HOME"
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager -print -quit)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::Android SDK sdkmanager was not found."
+            exit 1
+          fi
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+          echo "Android SDK: $ANDROID_HOME"
+          "$SDKMANAGER" --version
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          yes | "$SDKMANAGER" --licenses
+
+      - name: Install Android SDK and NDK packages
+        shell: bash
+        run: |
+          set -e
+
+          "$SDKMANAGER" --install \
             "platform-tools" \
             "platforms;android-30" \
             "build-tools;30.0.3" \
             "ndk;23.2.8568313" \
             "cmake;3.22.1"
 
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
           echo "NDK_ROOT=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
 
+      - name: Verify Android toolchain
+        run: |
+          set -e
+          test -d "$ANDROID_NDK_HOME"
+          test -d "$ANDROID_HOME/platforms/android-30"
+          test -d "$ANDROID_HOME/build-tools/30.0.3"
+          echo "Android SDK and NDK are ready."
+
       - name: Clone Limbo Android QEMU
         run: |
+          set -e
+
           git clone --depth 1 \
             https://github.com/limboemu/limbo.git \
             "$RUNNER_TEMP/limbo"
@@ -78,14 +116,14 @@ jobs:
       - name: Configure ARM32 QEMU
         working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
         run: |
-          echo "=== QEMU configuration ==="
+          set -e
+          test -f Makefile
+          test -d "$ANDROID_NDK_HOME"
+
           grep -R -n \
             -E 'BUILD_HOST|BUILD_GUEST|USE_QEMU_VERSION' \
             android-config android-limbo-config.mak Makefile \
             2>/dev/null || true
-
-          test -d "$ANDROID_NDK_HOME"
-          test -f Makefile
 
       - name: Build QEMU ARM engine
         working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
@@ -99,56 +137,54 @@ jobs:
           set -o pipefail
           make limbo 2>&1 | tee "$RUNNER_TEMP/qemu-build.log"
 
-      - name: Connect QEMU serial to localhost
+      - name: Connect QEMU serial
         working-directory: ${{ runner.temp }}/limbo
         run: |
           python3 <<'PY'
           from pathlib import Path
           import re
 
-          root = Path(".")
-          files = list(root.rglob("VMExecutor.java"))
+          files = list(Path(".").rglob("VMExecutor.java"))
           if not files:
               raise SystemExit("VMExecutor.java not found")
 
           target = None
-          for p in files:
-              s = p.read_text(errors="replace")
-              if 'paramsList.add("-serial")' in s and 'paramsList.add("none")' in s:
-                  target = p
+          for path in files:
+              source = path.read_text(errors="replace")
+              if ('paramsList.add("-serial")' in source
+                      and 'paramsList.add("none")' in source):
+                  target = path
                   break
 
           if target is None:
               raise SystemExit(
-                  "Could not locate the expected VMExecutor serial configuration"
+                  "Could not find the expected QEMU serial configuration"
               )
 
-          s = target.read_text()
-          old = '''paramsList.add("-serial");
-                          paramsList.add("none");'''
-          new = '''paramsList.add("-serial");
-                          paramsList.add("tcp:127.0.0.1:5555,server=on,wait=off");'''
+          source = target.read_text()
+          pattern = (
+              r'(paramsList\.add\("-serial"\);\s*)'
+              r'paramsList\.add\("none"\);'
+          )
+          updated, count = re.subn(
+              pattern,
+              r'\1paramsList.add("tcp:127.0.0.1:5555,server=on,wait=off");',
+              source,
+              count=1
+          )
 
-          if old in s:
-              s = s.replace(old, new, 1)
-          else:
-              pattern = r'(paramsList\.add\("-serial"\);\s*)paramsList\.add\("none"\);'
-              s, count = re.subn(
-                  pattern,
-                  r'\1paramsList.add("tcp:127.0.0.1:5555,server=on,wait=off");',
-                  s,
-                  count=1
-              )
-              if count != 1:
-                  raise SystemExit("Could not patch serial configuration")
+          if count != 1:
+              raise SystemExit("Could not patch QEMU serial configuration")
 
-          target.write_text(s)
-          print("Patched serial configuration:", target)
+          target.write_text(updated)
+          print("QEMU serial patched:", target)
           PY
 
-      - name: Verify native QEMU libraries
+      - name: Verify native QEMU library
         working-directory: ${{ runner.temp }}/limbo
         run: |
+          set -e
+
           find . -type f \
             \( -name 'libqemu-system-arm.so' \
             -o -name 'libqemu-system-aarch64.so' \) -print
@@ -159,32 +195,31 @@ jobs:
             exit 1
           fi
 
-      - name: Apply optional Scorp overlay
+      - name: Apply optional Scorpion overlay
         working-directory: ${{ runner.temp }}/limbo
         run: |
           if [ -d "$GITHUB_WORKSPACE/scorp-overlay" ]; then
             cp -a "$GITHUB_WORKSPACE/scorp-overlay/." .
-            echo "Scorp overlay applied."
+            echo "Scorpion overlay applied."
           else
-            echo "No optional overlay; using Limbo's existing Android interface."
+            echo "No scorp-overlay found; using Limbo's existing interface."
           fi
 
       - name: Build Android APK
         working-directory: ${{ runner.temp }}/limbo
         run: |
+          set -e
           chmod +x ./gradlew
 
-          export JAVA_HOME=/usr/lib/jvm/temurin-11-jdk-amd64
-          if [ ! -d "$JAVA_HOME" ]; then
-            export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
-          fi
+          export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
           export PATH="$JAVA_HOME/bin:$PATH"
 
           java -version
+
           ./gradlew --no-daemon \
             :limbo-android-arm:assembleDebug
 
-      - name: Collect APK and logs
+      - name: Collect APK and diagnostics
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
