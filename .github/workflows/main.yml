@@ -24,8 +24,11 @@ jobs:
 
     env:
       BUILD_HOST: armeabi-v7a
-      BUILD_GUEST: arm-softmmu
+      BUILD_GUEST: aarch64-softmmu
       USE_QEMU_VERSION: "5.1.0"
+      USE_GCC: "false"
+      USE_AAUDIO: "false"
+      USE_KVM: "false"
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
@@ -52,10 +55,11 @@ jobs:
             git curl wget unzip zip xz-utils \
             build-essential make cmake ninja-build \
             autoconf automake libtool pkg-config \
-            flex bison gettext python3 \
-            binutils patch perl file
+            flex bison gettext texinfo rsync \
+            python3 binutils patch perl file \
+            libglib2.0-dev
 
-      - name: Configure Java
+      - name: Configure Java 11
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -72,7 +76,7 @@ jobs:
             -type f -name sdkmanager -print -quit)"
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "::error::Android SDK sdkmanager was not found."
+            echo "::error::sdkmanager was not found."
             exit 1
           fi
 
@@ -80,21 +84,13 @@ jobs:
           echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
-          echo "Android SDK: $ANDROID_HOME"
           "$SDKMANAGER" --version
 
       - name: Accept Android SDK licenses
         shell: bash
         run: |
-          set +e
-          yes | "$SDKMANAGER" --licenses
-          sdk_status=${PIPESTATUS[1]}
           set -e
-
-          if [ "$sdk_status" -ne 0 ]; then
-            echo "::error::Android SDK license acceptance failed."
-            exit "$sdk_status"
-          fi
+          "$SDKMANAGER" --licenses < <(yes)
 
       - name: Install Android SDK and NDK
         shell: bash
@@ -103,8 +99,8 @@ jobs:
 
           "$SDKMANAGER" --install \
             "platform-tools" \
-            "platforms;android-30" \
-            "build-tools;30.0.3" \
+            "platforms;android-29" \
+            "build-tools;29.0.3" \
             "ndk;23.2.8568313" \
             "cmake;3.22.1"
 
@@ -115,12 +111,14 @@ jobs:
         shell: bash
         run: |
           set -e
-          test -d "$ANDROID_NDK_HOME"
-          test -d "$ANDROID_HOME/platforms/android-30"
-          test -d "$ANDROID_HOME/build-tools/30.0.3"
-          echo "Android SDK and NDK are ready."
 
-      - name: Clone Limbo Android QEMU
+          test -x "$ANDROID_NDK_HOME/ndk-build"
+          test -d "$ANDROID_HOME/platforms/android-29"
+          test -d "$ANDROID_HOME/build-tools/29.0.3"
+
+          echo "SDK, build-tools and NDK verified."
+
+      - name: Clone Limbo source
         shell: bash
         run: |
           set -e
@@ -129,53 +127,152 @@ jobs:
             https://github.com/limboemu/limbo.git \
             "$RUNNER_TEMP/limbo"
 
+          test -f "$RUNNER_TEMP/limbo/gradlew"
           test -f "$RUNNER_TEMP/limbo/limbo-android-lib/src/main/jni/Makefile"
-          test -d "$RUNNER_TEMP/limbo/limbo-android-arm"
+          test -f "$RUNNER_TEMP/limbo/limbo-android-lib/src/main/jni/patches/qemu-5.1.0.patch"
 
           echo "LIMBO_DIR=$RUNNER_TEMP/limbo" >> "$GITHUB_ENV"
 
-      - name: Configure ARM32 QEMU
-        working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
+      - name: Download and prepare native libraries
         shell: bash
+        working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/limbo-sources"
+
+          download() {
+            local url="$1"
+            local output="$2"
+
+            wget \
+              --tries=5 \
+              --retry-connrefused \
+              --timeout=30 \
+              -O "$output" "$url"
+          }
+
+          download \
+            "https://download.qemu.org/qemu-5.1.0.tar.xz" \
+            "$RUNNER_TEMP/limbo-sources/qemu.tar.xz"
+
+          download \
+            "https://ftp.gnome.org/pub/GNOME/sources/glib/2.56/glib-2.56.1.tar.xz" \
+            "$RUNNER_TEMP/limbo-sources/glib.tar.xz"
+
+          download \
+            "https://sourceware.org/pub/libffi/libffi-3.3.tar.gz" \
+            "$RUNNER_TEMP/limbo-sources/libffi.tar.gz"
+
+          download \
+            "https://www.cairographics.org/releases/pixman-0.40.0.tar.gz" \
+            "$RUNNER_TEMP/limbo-sources/pixman.tar.gz"
+
+          download \
+            "https://www.libsdl.org/release/SDL2-2.0.8.tar.gz" \
+            "$RUNNER_TEMP/limbo-sources/SDL2.tar.gz"
+
+          rm -rf qemu glib libffi pixman SDL2
+          mkdir -p qemu glib libffi pixman SDL2
+
+          tar -xf "$RUNNER_TEMP/limbo-sources/qemu.tar.xz" \
+            --strip-components=1 -C qemu
+
+          tar -xf "$RUNNER_TEMP/limbo-sources/glib.tar.xz" \
+            --strip-components=1 -C glib
+
+          tar -xf "$RUNNER_TEMP/limbo-sources/libffi.tar.gz" \
+            --strip-components=1 -C libffi
+
+          tar -xf "$RUNNER_TEMP/limbo-sources/pixman.tar.gz" \
+            --strip-components=1 -C pixman
+
+          tar -xf "$RUNNER_TEMP/limbo-sources/SDL2.tar.gz" \
+            --strip-components=1 -C SDL2
+
+          patch --forward -d qemu -p1 \
+            < patches/qemu-5.1.0.patch
+
+          patch --forward -d glib -p1 \
+            < patches/glib-2.56.1.patch
+
+          patch --forward -d SDL2 -p1 \
+            < patches/sdl2-2.0.8.patch
+
+          test -f qemu/configure
+          test -f glib/configure
+          test -f libffi/configure
+          test -f pixman/configure
+          test -f SDL2/configure
+
+          echo "All native source archives and patches verified."
+
+      - name: Configure NDK missing-dependency handling
+        shell: bash
+        working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
         run: |
           set -e
 
-          test -f Makefile
-          test -d "$ANDROID_NDK_HOME"
+          if ! grep -q 'APP_ALLOW_MISSING_DEPS' Application.mk; then
+            printf '\nAPP_ALLOW_MISSING_DEPS := true\n' >> Application.mk
+          fi
 
-          grep -R -n \
-            -E 'BUILD_HOST|BUILD_GUEST|USE_QEMU_VERSION' \
-            android-config android-limbo-config.mak Makefile \
-            2>/dev/null || true
+          grep -n 'APP_ALLOW_MISSING_DEPS' Application.mk
 
-      - name: Build QEMU ARM engine
+      - name: Build QEMU ARM guest engine
+        shell: bash
         working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
         env:
           BUILD_HOST: armeabi-v7a
-          BUILD_GUEST: arm-softmmu
+          BUILD_GUEST: aarch64-softmmu
           USE_QEMU_VERSION: "5.1.0"
           USE_GCC: "false"
+          USE_AAUDIO: "false"
+          USE_KVM: "false"
           NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
-        shell: bash
         run: |
           set -o pipefail
+
+          echo "=== Build configuration ==="
+          echo "BUILD_HOST=$BUILD_HOST"
+          echo "BUILD_GUEST=$BUILD_GUEST"
+          echo "NDK_ROOT=$NDK_ROOT"
+
           make limbo 2>&1 | tee "$RUNNER_TEMP/qemu-build.log"
 
-      - name: Connect QEMU serial
-        working-directory: ${{ runner.temp }}/limbo
+      - name: Verify native QEMU library
         shell: bash
+        working-directory: ${{ runner.temp }}/limbo
         run: |
+          set -e
+
+          find limbo-android-arm/src/main/jniLibs \
+            -type f -name 'libqemu-system-*.so' -print
+
+          if ! find limbo-android-arm/src/main/jniLibs \
+            -type f -name 'libqemu-system-aarch64.so' \
+            -print -quit | grep -q .; then
+            echo "::error::libqemu-system-aarch64.so was not generated."
+            exit 1
+          fi
+
+          echo "QEMU AArch64 system engine found."
+
+      - name: Patch QEMU serial backend
+        shell: bash
+        working-directory: ${{ runner.temp }}/limbo
+        run: |
+          set -e
+
           python3 <<'PY'
           from pathlib import Path
           import re
 
-          files = list(Path(".").rglob("VMExecutor.java"))
-          if not files:
-              raise SystemExit("VMExecutor.java not found")
+          candidates = list(Path(".").rglob("VMExecutor.java"))
+          if not candidates:
+              raise SystemExit("VMExecutor.java was not found")
 
           target = None
-
-          for path in files:
+          for path in candidates:
               source = path.read_text(errors="replace")
               if (
                   'paramsList.add("-serial")' in source
@@ -186,11 +283,11 @@ jobs:
 
           if target is None:
               raise SystemExit(
-                  "Could not find the expected QEMU serial configuration"
+                  "Expected serial configuration was not found; "
+                  "refusing to silently skip the patch."
               )
 
           source = target.read_text()
-
           pattern = (
               r'(paramsList\.add\("-serial"\);\s*)'
               r'paramsList.add\("none"\);'
@@ -204,45 +301,30 @@ jobs:
           )
 
           if count != 1:
-              raise SystemExit("Could not patch QEMU serial configuration")
+              raise SystemExit("Serial patch did not apply exactly once")
 
           target.write_text(updated)
-          print("QEMU serial patched:", target)
+          print("Serial backend patched:", target)
           PY
 
-      - name: Verify native QEMU library
-        working-directory: ${{ runner.temp }}/limbo
+      - name: Apply optional Scorpion overlay
         shell: bash
+        working-directory: ${{ runner.temp }}/limbo
         run: |
           set -e
 
-          find . -type f \
-            \( -name 'libqemu-system-arm.so' \
-            -o -name 'libqemu-system-aarch64.so' \) -print
-
-          if ! find . -type f -name 'libqemu-system-arm.so' \
-            -print -quit | grep -q .; then
-            echo "::error::QEMU ARM library was not found."
-            exit 1
-          fi
-
-      - name: Apply optional Scorpion overlay
-        working-directory: ${{ runner.temp }}/limbo
-        shell: bash
-        run: |
           if [ -d "$GITHUB_WORKSPACE/scorp-overlay" ]; then
             cp -a "$GITHUB_WORKSPACE/scorp-overlay/." .
             echo "Scorpion overlay applied."
           else
-            echo "No scorp-overlay found; using Limbo's existing interface."
+            echo "No scorp-overlay directory; using existing Limbo UI."
           fi
 
       - name: Build Android APK
-        working-directory: ${{ runner.temp }}/limbo
         shell: bash
+        working-directory: ${{ runner.temp }}/limbo
         run: |
           set -e
-
           chmod +x ./gradlew
           java -version
 
@@ -261,10 +343,11 @@ jobs:
               2>/dev/null || true
           fi
 
-          if [ -f "$RUNNER_TEMP/qemu-build.log" ]; then
-            cp "$RUNNER_TEMP/qemu-build.log" \
-              "$GITHUB_WORKSPACE/artifacts/"
-          fi
+          for log in qemu-build.log; do
+            if [ -f "$RUNNER_TEMP/$log" ]; then
+              cp "$RUNNER_TEMP/$log" "$GITHUB_WORKSPACE/artifacts/"
+            fi
+          done
 
           ls -lh "$GITHUB_WORKSPACE/artifacts" || true
 
