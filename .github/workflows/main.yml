@@ -1,0 +1,164 @@
+
+name: Scorp Android - Limbo QEMU ARM32
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/build-scorp-android.yml"
+      - "scorp-overlay/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scorp-android-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build QEMU ARM32 for Android
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      BUILD_HOST: armeabi-v7a
+      BUILD_GUEST: arm-softmmu
+      USE_QEMU_VERSION: "4.0.0"
+      ANDROID_MIN_SDK: "23"
+
+    steps:
+      - name: Checkout Scorp project
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget unzip zip xz-utils \
+            build-essential make cmake ninja-build \
+            autoconf automake libtool pkg-config \
+            flex bison gettext python3 python3-pip \
+            binutils patch perl file \
+            openjdk-17-jdk
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;23.2.8568313" \
+            "cmake;3.22.1"
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
+          echo "NDK_ROOT=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Clone Limbo QEMU Android source
+        run: |
+          git clone --depth 1 \
+            https://github.com/limboemu/limbo.git \
+            "$RUNNER_TEMP/limbo"
+
+          echo "LIMBO_DIR=$RUNNER_TEMP/limbo" >> "$GITHUB_ENV"
+
+          test -d "$RUNNER_TEMP/limbo/limbo-android-lib/src/main/jni"
+          test -d "$RUNNER_TEMP/limbo/limbo-android-arm"
+
+          echo "Limbo Android ARM module found."
+          find "$RUNNER_TEMP/limbo" -maxdepth 2 -type f \
+            \( -name 'settings.gradle' \
+            -o -name 'build.gradle' \
+            -o -name 'gradlew' \) -print
+
+      - name: Prepare native build configuration
+        working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
+        run: |
+          echo "=== Native build configuration ==="
+          grep -R -n \
+            -E 'USE_QEMU_VERSION|BUILD_GUEST|BUILD_HOST|NDK_ROOT|USE_GCC' \
+            android-config android-limbo-config.mak Makefile \
+            2>/dev/null || true
+
+          test -f Makefile
+          test -d "$ANDROID_NDK_HOME"
+
+      - name: Build native QEMU ARM32 engine
+        working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
+        env:
+          BUILD_HOST: armeabi-v7a
+          BUILD_GUEST: arm-softmmu
+          USE_QEMU_VERSION: "4.0.0"
+          USE_GCC: "false"
+          NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -o pipefail
+          make limbo 2>&1 | tee "$RUNNER_TEMP/qemu-build.log"
+
+      - name: Verify QEMU native libraries
+        working-directory: ${{ runner.temp }}/limbo
+        run: |
+          echo "=== ARM32 QEMU libraries ==="
+          find . -type f \
+            \( -name 'libqemu-system-arm.so' \
+            -o -name 'libSDL2.so' \
+            -o -name 'liblimbo.so' \) -print
+
+          if ! find . -type f \
+            -name 'libqemu-system-arm.so' -print -quit | grep -q .; then
+            echo "::error::QEMU ARM system library was not produced."
+            echo "Inspect the native build log before continuing."
+            exit 1
+          fi
+
+      - name: Apply Scorp overlay if provided
+        working-directory: ${{ runner.temp }}/limbo
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/scorp-overlay" ]; then
+            echo "Scorp overlay directory found."
+            cp -a "$GITHUB_WORKSPACE/scorp-overlay/." .
+          else
+            echo "No scorp-overlay directory exists yet."
+            echo "Building the Limbo ARM frontend as the integration base."
+          fi
+
+      - name: Build Android APK
+        working-directory: ${{ runner.temp }}/limbo
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon \
+            :limbo-android-arm:assembleDebug
+
+      - name: Collect APK and diagnostics
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          find "$RUNNER_TEMP/limbo" \
+            -type f -name '*.apk' \
+            -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; \
+            2>/dev/null || true
+
+          if [ -f "$RUNNER_TEMP/qemu-build.log" ]; then
+            cp "$RUNNER_TEMP/qemu-build.log" \
+              "$GITHUB_WORKSPACE/artifacts/"
+          fi
+
+          echo "=== Produced artifacts ==="
+          ls -lh "$GITHUB_WORKSPACE/artifacts" || true
+
+      - name: Upload APK and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorp-android-arm32-build
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
