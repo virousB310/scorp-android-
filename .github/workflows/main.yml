@@ -34,23 +34,34 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install build dependencies
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          set -e
+
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            update
+
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            install -y \
             git curl wget unzip zip xz-utils \
             build-essential make cmake ninja-build \
             autoconf automake libtool pkg-config \
             flex bison gettext python3 \
-            binutils patch perl file \
-            openjdk-11-jdk openjdk-17-jdk
+            binutils patch perl file
 
       - name: Configure Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "11"
 
-      - name: Locate existing Android SDK
+      - name: Locate Android SDK
         shell: bash
         run: |
           set -e
@@ -75,9 +86,17 @@ jobs:
       - name: Accept Android SDK licenses
         shell: bash
         run: |
+          set +e
           yes | "$SDKMANAGER" --licenses
+          sdk_status=${PIPESTATUS[1]}
+          set -e
 
-      - name: Install Android SDK and NDK packages
+          if [ "$sdk_status" -ne 0 ]; then
+            echo "::error::Android SDK license acceptance failed."
+            exit "$sdk_status"
+          fi
+
+      - name: Install Android SDK and NDK
         shell: bash
         run: |
           set -e
@@ -93,6 +112,7 @@ jobs:
           echo "NDK_ROOT=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
 
       - name: Verify Android toolchain
+        shell: bash
         run: |
           set -e
           test -d "$ANDROID_NDK_HOME"
@@ -101,6 +121,7 @@ jobs:
           echo "Android SDK and NDK are ready."
 
       - name: Clone Limbo Android QEMU
+        shell: bash
         run: |
           set -e
 
@@ -115,8 +136,10 @@ jobs:
 
       - name: Configure ARM32 QEMU
         working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
+        shell: bash
         run: |
           set -e
+
           test -f Makefile
           test -d "$ANDROID_NDK_HOME"
 
@@ -133,12 +156,14 @@ jobs:
           USE_QEMU_VERSION: "5.1.0"
           USE_GCC: "false"
           NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+        shell: bash
         run: |
           set -o pipefail
           make limbo 2>&1 | tee "$RUNNER_TEMP/qemu-build.log"
 
       - name: Connect QEMU serial
         working-directory: ${{ runner.temp }}/limbo
+        shell: bash
         run: |
           python3 <<'PY'
           from pathlib import Path
@@ -149,10 +174,13 @@ jobs:
               raise SystemExit("VMExecutor.java not found")
 
           target = None
+
           for path in files:
               source = path.read_text(errors="replace")
-              if ('paramsList.add("-serial")' in source
-                      and 'paramsList.add("none")' in source):
+              if (
+                  'paramsList.add("-serial")' in source
+                  and 'paramsList.add("none")' in source
+              ):
                   target = path
                   break
 
@@ -162,10 +190,12 @@ jobs:
               )
 
           source = target.read_text()
+
           pattern = (
               r'(paramsList\.add\("-serial"\);\s*)'
-              r'paramsList\.add\("none"\);'
+              r'paramsList.add\("none"\);'
           )
+
           updated, count = re.subn(
               pattern,
               r'\1paramsList.add("tcp:127.0.0.1:5555,server=on,wait=off");',
@@ -182,6 +212,7 @@ jobs:
 
       - name: Verify native QEMU library
         working-directory: ${{ runner.temp }}/limbo
+        shell: bash
         run: |
           set -e
 
@@ -197,6 +228,7 @@ jobs:
 
       - name: Apply optional Scorpion overlay
         working-directory: ${{ runner.temp }}/limbo
+        shell: bash
         run: |
           if [ -d "$GITHUB_WORKSPACE/scorp-overlay" ]; then
             cp -a "$GITHUB_WORKSPACE/scorp-overlay/." .
@@ -207,13 +239,11 @@ jobs:
 
       - name: Build Android APK
         working-directory: ${{ runner.temp }}/limbo
+        shell: bash
         run: |
           set -e
+
           chmod +x ./gradlew
-
-          export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
-          export PATH="$JAVA_HOME/bin:$PATH"
-
           java -version
 
           ./gradlew --no-daemon \
@@ -221,6 +251,7 @@ jobs:
 
       - name: Collect APK and diagnostics
         if: always()
+        shell: bash
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
