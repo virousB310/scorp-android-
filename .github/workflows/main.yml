@@ -1,5 +1,5 @@
 
-name: Scorp Android - QEMU ARM32
+name: Scorpion Emulator - Android ARM32
 
 on:
   workflow_dispatch:
@@ -8,17 +8,18 @@ on:
     paths:
       - ".github/workflows/main.yml"
       - "scorp-overlay/**"
+      - "README.md"
 
 permissions:
   contents: read
 
 concurrency:
-  group: scorp-android-build
+  group: scorpion-emulator-build
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build Scorp Android
+    name: Build Scorpion Emulator APK
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -29,100 +30,66 @@ jobs:
       USE_GCC: "false"
       USE_AAUDIO: "false"
       USE_KVM: "false"
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-      - name: Checkout Scorp project
+      - name: Checkout Scorpion project
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install Ubuntu dependencies
         shell: bash
         run: |
-          set -e
-
-          sudo apt-get \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 \
-            update
-
-          sudo apt-get \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 \
-            install -y \
+          set -euxo pipefail
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get install -y --no-install-recommends \
             git curl wget unzip zip xz-utils \
             build-essential make cmake ninja-build \
             autoconf automake libtool pkg-config \
             flex bison gettext texinfo rsync \
             python3 binutils patch perl file \
-            libglib2.0-dev
+            libglib2.0-dev libpixman-1-dev \
+            libffi-dev zlib1g-dev libssl-dev \
+            ca-certificates
 
-      - name: Configure Java 11
+      - name: Install Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "11"
+          cache: gradle
 
-      - name: Locate Android SDK
-        shell: bash
-        run: |
-          set -e
-
-          test -d "$ANDROID_HOME"
-
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager -print -quit)"
-
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager was not found."
-            exit 1
-          fi
-
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-
-          "$SDKMANAGER" --version
-
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: |
-          set -e
-          "$SDKMANAGER" --licenses < <(yes)
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Install Android SDK and NDK
         shell: bash
         run: |
-          set -e
-
-          "$SDKMANAGER" --install \
+          set -euxo pipefail
+          sdkmanager --install \
             "platform-tools" \
             "platforms;android-29" \
             "build-tools;29.0.3" \
             "ndk;23.2.8568313" \
             "cmake;3.22.1"
 
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
           echo "NDK_ROOT=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
 
       - name: Verify Android toolchain
         shell: bash
         run: |
-          set -e
-
-          test -x "$ANDROID_NDK_HOME/ndk-build"
+          set -euxo pipefail
+          test -x "$ANDROID_HOME/ndk/23.2.8568313/ndk-build"
           test -d "$ANDROID_HOME/platforms/android-29"
           test -d "$ANDROID_HOME/build-tools/29.0.3"
+          java -version
+          "$ANDROID_HOME/ndk/23.2.8568313/ndk-build" --version
 
-          echo "SDK, build-tools and NDK verified."
-
-      - name: Clone Limbo source
+      - name: Download Android app source
         shell: bash
         run: |
-          set -e
-
+          set -euxo pipefail
           git clone --depth 1 \
             https://github.com/limboemu/limbo.git \
             "$RUNNER_TEMP/limbo"
@@ -133,70 +100,312 @@ jobs:
 
           echo "LIMBO_DIR=$RUNNER_TEMP/limbo" >> "$GITHUB_ENV"
 
-      - name: Download and prepare native libraries
+      - name: Generate Scorpion Android interface
+        shell: bash
+        working-directory: ${{ runner.temp }}/limbo
+        run: |
+          set -euxo pipefail
+
+          JAVA_DIR="limbo-android-arm/src/main/java/com/limbo/emu/main/arm"
+          MANIFEST="limbo-android-arm/src/main/AndroidManifest.xml"
+
+          test -f "$MANIFEST"
+
+          # Find the real package directory from the existing activity.
+          ACTIVITY_FILE="$(find limbo-android-arm/src/main -name LimboEmuActivity.java -print -quit)"
+          test -n "$ACTIVITY_FILE"
+          JAVA_DIR="$(dirname "$ACTIVITY_FILE")"
+
+          PACKAGE="$(sed -n 's/^package[[:space:]]\+//p' "$ACTIVITY_FILE" | head -n 1 | tr -d ';')"
+          test -n "$PACKAGE"
+
+          HOME_CLASS="$PACKAGE.ScorpionHomeActivity"
+
+          mkdir -p "$JAVA_DIR"
+
+          cat > "$JAVA_DIR/ScorpionHomeActivity.java" <<JAVA
+          package $PACKAGE;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class ScorpionHomeActivity extends Activity {
+              private final int bg = Color.rgb(7, 12, 10);
+              private final int green = Color.rgb(57, 255, 130);
+              private final int muted = Color.rgb(155, 178, 163);
+
+              private GradientDrawable shape(int color, int stroke) {
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(color);
+                  d.setCornerRadius(22);
+                  if (stroke != 0) d.setStroke(2, stroke);
+                  return d;
+              }
+
+              private TextView text(String value, int size, int color) {
+                  TextView t = new TextView(this);
+                  t.setText(value);
+                  t.setTextSize(size);
+                  t.setTextColor(color);
+                  t.setGravity(Gravity.CENTER);
+                  t.setTypeface(Typeface.create("monospace", Typeface.NORMAL));
+                  return t;
+              }
+
+              private Button button(String label, boolean primary) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setTextSize(13);
+                  b.setAllCaps(false);
+                  b.setTextColor(primary ? Color.BLACK : green);
+                  b.setTypeface(Typeface.create("monospace", Typeface.BOLD));
+                  b.setBackground(shape(
+                      primary ? green : Color.rgb(15, 25, 19),
+                      primary ? 0 : green
+                  ));
+                  b.setPadding(12, 15, 12, 15);
+                  return b;
+              }
+
+              private void space(LinearLayout root, int height) {
+                  View v = new View(this);
+                  root.addView(v, new LinearLayout.LayoutParams(1, height));
+              }
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+
+                  getWindow().setStatusBarColor(bg);
+                  getWindow().setNavigationBarColor(bg);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setFillViewport(true);
+                  scroll.setBackgroundColor(bg);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.setPadding(24, 34, 24, 28);
+                  scroll.addView(root);
+
+                  TextView logo = text("SCORPION", 34, green);
+                  logo.setTypeface(Typeface.create("monospace", Typeface.BOLD));
+                  root.addView(logo, new LinearLayout.LayoutParams(-1, 64));
+
+                  root.addView(text("ANDROID VIRTUAL MACHINE", 12, muted));
+                  space(root, 32);
+
+                  LinearLayout panel = new LinearLayout(this);
+                  panel.setOrientation(LinearLayout.VERTICAL);
+                  panel.setGravity(Gravity.CENTER);
+                  panel.setPadding(18, 24, 18, 24);
+                  panel.setBackground(shape(Color.rgb(13, 22, 16), green));
+
+                  panel.addView(text("SYSTEM STATUS", 13, muted));
+                  space(panel, 12);
+                  panel.addView(text("SCORPION EMULATOR", 18, green));
+                  space(panel, 8);
+                  panel.addView(text("ARM / QEMU ENGINE", 12, muted));
+
+                  root.addView(panel, new LinearLayout.LayoutParams(-1, -2));
+                  space(root, 28);
+
+                  Button start = button("OPEN VM CONFIGURATION  >", true);
+                  root.addView(start, new LinearLayout.LayoutParams(-1, 62));
+
+                  start.setOnClickListener(v -> {
+                      try {
+                          startActivity(new Intent(
+                              ScorpionHomeActivity.this,
+                              LimboEmuActivity.class
+                          ));
+                      } catch (Exception e) {
+                          Toast.makeText(
+                              ScorpionHomeActivity.this,
+                              "Could not open VM configuration",
+                              Toast.LENGTH_LONG
+                          ).show();
+                      }
+                  });
+
+                  space(root, 14);
+
+                  Button about = button("ABOUT SCORPION", false);
+                  root.addView(about, new LinearLayout.LayoutParams(-1, 56));
+                  about.setOnClickListener(v -> Toast.makeText(
+                      this,
+                      "Scorpion Emulator - QEMU engine",
+                      Toast.LENGTH_LONG
+                  ).show());
+
+                  space(root, 30);
+                  root.addView(text("BUILT FOR SCORPION LINUX", 11, muted));
+                  root.addView(text("CONTROL  /  EMULATE  /  EXPLORE", 10, green));
+
+                  setContentView(scroll);
+              }
+          }
+          JAVA
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import xml.etree.ElementTree as ET
+
+          manifest = Path("limbo-android-arm/src/main/AndroidManifest.xml")
+          android = "http://schemas.android.com/apk/res/android"
+          ET.register_namespace("android", android)
+
+          package = os.environ.get("SCORPION_PACKAGE")
+          if not package:
+              import subprocess
+              src = Path("limbo-android-arm/src/main")
+              java = next(src.rglob("LimboEmuActivity.java"), None)
+              if java is None:
+                  raise SystemExit("LimboEmuActivity.java not found")
+              first = java.read_text(errors="replace").splitlines()
+              package_line = next(
+                  (line for line in first if line.strip().startswith("package ")),
+                  None
+              )
+              if package_line is None:
+                  raise SystemExit("Could not determine Java package")
+              package = package_line.strip()[8:].rstrip(";").strip()
+
+          launcher_name = package + ".ScorpionHomeActivity"
+          name_attr = "{" + android + "}name"
+          exported_attr = "{" + android + "}exported"
+          label_attr = "{" + android + "}label"
+
+          tree = ET.parse(manifest)
+          root = tree.getroot()
+          app = root.find("application")
+          if app is None:
+              raise SystemExit("Manifest has no application element")
+
+          # Remove only MAIN/LAUNCHER filters; preserve all other filters.
+          for activity in list(app):
+              if activity.tag not in ("activity", "activity-alias"):
+                  continue
+              for filt in list(activity.findall("intent-filter")):
+                  actions = [x.get(name_attr) for x in filt.findall("action")]
+                  categories = [
+                      x.get(name_attr) for x in filt.findall("category")
+                  ]
+                  if (
+                      "android.intent.action.MAIN" in actions
+                      and "android.intent.category.LAUNCHER" in categories
+                  ):
+                      activity.remove(filt)
+
+          home = next(
+              (
+                  a for a in app.findall("activity")
+                  if a.get(name_attr) == launcher_name
+              ),
+              None
+          )
+          if home is None:
+              home = ET.SubElement(app, "activity")
+
+          home.set(name_attr, launcher_name)
+          home.set(exported_attr, "true")
+          home.set(label_attr, "Scorpion Emulator")
+
+          intent = ET.SubElement(home, "intent-filter")
+          ET.SubElement(intent, "action").set(
+              name_attr, "android.intent.action.MAIN"
+          )
+          ET.SubElement(intent, "category").set(
+              name_attr, "android.intent.category.LAUNCHER"
+          )
+
+          ET.indent(tree, space="    ")
+          tree.write(manifest, encoding="utf-8", xml_declaration=True)
+
+          # Validate the manifest XML and new launcher.
+          check = ET.parse(manifest).getroot()
+          app = check.find("application")
+          count = 0
+          for activity in app.findall("activity"):
+              for filt in activity.findall("intent-filter"):
+                  actions = [x.get(name_attr) for x in filt.findall("action")]
+                  categories = [
+                      x.get(name_attr) for x in filt.findall("category")
+                  ]
+                  if (
+                      activity.get(name_attr) == launcher_name
+                      and "android.intent.action.MAIN" in actions
+                      and "android.intent.category.LAUNCHER" in categories
+                  ):
+                      count += 1
+
+          if count != 1:
+              raise SystemExit("Scorpion launcher validation failed")
+
+          print("Scorpion launcher generated and validated.")
+          PY
+
+          echo "Scorpion Android interface generated."
+
+      - name: Download QEMU and native library sources
         shell: bash
         working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
         run: |
-          set -e
-          mkdir -p "$RUNNER_TEMP/limbo-sources"
+          set -euxo pipefail
+
+          mkdir -p "$RUNNER_TEMP/scorpion-sources"
 
           download() {
-            local url="$1"
-            local output="$2"
-
-            wget \
-              --tries=5 \
-              --retry-connrefused \
-              --timeout=30 \
-              -O "$output" "$url"
+            wget --tries=5 --retry-connrefused --timeout=30 \
+              -O "$2" "$1"
+            test -s "$2"
           }
 
-          download \
-            "https://download.qemu.org/qemu-5.1.0.tar.xz" \
-            "$RUNNER_TEMP/limbo-sources/qemu.tar.xz"
+          download "https://download.qemu.org/qemu-5.1.0.tar.xz" \
+            "$RUNNER_TEMP/scorpion-sources/qemu.tar.xz"
 
-          download \
-            "https://ftp.gnome.org/pub/GNOME/sources/glib/2.56/glib-2.56.1.tar.xz" \
-            "$RUNNER_TEMP/limbo-sources/glib.tar.xz"
+          download "https://ftp.gnome.org/pub/GNOME/sources/glib/2.56/glib-2.56.1.tar.xz" \
+            "$RUNNER_TEMP/scorpion-sources/glib.tar.xz"
 
-          download \
-            "https://sourceware.org/pub/libffi/libffi-3.3.tar.gz" \
-            "$RUNNER_TEMP/limbo-sources/libffi.tar.gz"
+          download "https://sourceware.org/pub/libffi/libffi-3.3.tar.gz" \
+            "$RUNNER_TEMP/scorpion-sources/libffi.tar.gz"
 
-          download \
-            "https://www.cairographics.org/releases/pixman-0.40.0.tar.gz" \
-            "$RUNNER_TEMP/limbo-sources/pixman.tar.gz"
+          download "https://www.cairographics.org/releases/pixman-0.40.0.tar.gz" \
+            "$RUNNER_TEMP/scorpion-sources/pixman.tar.gz"
 
-          download \
-            "https://www.libsdl.org/release/SDL2-2.0.8.tar.gz" \
-            "$RUNNER_TEMP/limbo-sources/SDL2.tar.gz"
+          download "https://www.libsdl.org/release/SDL2-2.0.8.tar.gz" \
+            "$RUNNER_TEMP/scorpion-sources/SDL2.tar.gz"
 
           rm -rf qemu glib libffi pixman SDL2
           mkdir -p qemu glib libffi pixman SDL2
 
-          tar -xf "$RUNNER_TEMP/limbo-sources/qemu.tar.xz" \
+          tar -xf "$RUNNER_TEMP/scorpion-sources/qemu.tar.xz" \
             --strip-components=1 -C qemu
-
-          tar -xf "$RUNNER_TEMP/limbo-sources/glib.tar.xz" \
+          tar -xf "$RUNNER_TEMP/scorpion-sources/glib.tar.xz" \
             --strip-components=1 -C glib
-
-          tar -xf "$RUNNER_TEMP/limbo-sources/libffi.tar.gz" \
+          tar -xf "$RUNNER_TEMP/scorpion-sources/libffi.tar.gz" \
             --strip-components=1 -C libffi
-
-          tar -xf "$RUNNER_TEMP/limbo-sources/pixman.tar.gz" \
+          tar -xf "$RUNNER_TEMP/scorpion-sources/pixman.tar.gz" \
             --strip-components=1 -C pixman
-
-          tar -xf "$RUNNER_TEMP/limbo-sources/SDL2.tar.gz" \
+          tar -xf "$RUNNER_TEMP/scorpion-sources/SDL2.tar.gz" \
             --strip-components=1 -C SDL2
 
-          patch --forward -d qemu -p1 \
-            < patches/qemu-5.1.0.patch
-
-          patch --forward -d glib -p1 \
-            < patches/glib-2.56.1.patch
-
-          patch --forward -d SDL2 -p1 \
-            < patches/sdl2-2.0.8.patch
+          patch --forward -d qemu -p1 < patches/qemu-5.1.0.patch
+          patch --forward -d glib -p1 < patches/glib-2.56.1.patch
+          patch --forward -d SDL2 -p1 < patches/sdl2-2.0.8.patch
 
           test -f qemu/configure
           test -f glib/configure
@@ -204,21 +413,17 @@ jobs:
           test -f pixman/configure
           test -f SDL2/configure
 
-          echo "All native source archives and patches verified."
-
-      - name: Configure NDK missing-dependency handling
+      - name: Configure NDK
         shell: bash
         working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
         run: |
-          set -e
-
-          if ! grep -q 'APP_ALLOW_MISSING_DEPS' Application.mk; then
+          set -euxo pipefail
+          if ! grep -q '^APP_ALLOW_MISSING_DEPS' Application.mk; then
             printf '\nAPP_ALLOW_MISSING_DEPS := true\n' >> Application.mk
           fi
-
           grep -n 'APP_ALLOW_MISSING_DEPS' Application.mk
 
-      - name: Build QEMU ARM guest engine
+      - name: Build QEMU ARM system engine
         shell: bash
         working-directory: ${{ runner.temp }}/limbo/limbo-android-lib/src/main/jni
         env:
@@ -231,47 +436,35 @@ jobs:
           NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -o pipefail
-
-          echo "=== Build configuration ==="
-          echo "BUILD_HOST=$BUILD_HOST"
-          echo "BUILD_GUEST=$BUILD_GUEST"
-          echo "NDK_ROOT=$NDK_ROOT"
-
+          echo "Android ABI: $BUILD_HOST"
+          echo "QEMU system target: $BUILD_GUEST"
           make limbo 2>&1 | tee "$RUNNER_TEMP/qemu-build.log"
 
-      - name: Verify native QEMU library
+      - name: Verify QEMU library
         shell: bash
         working-directory: ${{ runner.temp }}/limbo
         run: |
-          set -e
-
+          set -euxo pipefail
           find limbo-android-arm/src/main/jniLibs \
             -type f -name 'libqemu-system-*.so' -print
 
-          if ! find limbo-android-arm/src/main/jniLibs \
+          test -n "$(find limbo-android-arm/src/main/jniLibs \
             -type f -name 'libqemu-system-aarch64.so' \
-            -print -quit | grep -q .; then
-            echo "::error::libqemu-system-aarch64.so was not generated."
-            exit 1
-          fi
+            -print -quit)"
 
-          echo "QEMU AArch64 system engine found."
-
-      - name: Patch QEMU serial backend
+      - name: Configure serial console
         shell: bash
         working-directory: ${{ runner.temp }}/limbo
         run: |
-          set -e
+          set -euxo pipefail
 
           python3 <<'PY'
           from pathlib import Path
           import re
 
           candidates = list(Path(".").rglob("VMExecutor.java"))
-          if not candidates:
-              raise SystemExit("VMExecutor.java was not found")
-
           target = None
+
           for path in candidates:
               source = path.read_text(errors="replace")
               if (
@@ -283,8 +476,7 @@ jobs:
 
           if target is None:
               raise SystemExit(
-                  "Expected serial configuration was not found; "
-                  "refusing to silently skip the patch."
+                  "Serial configuration not found; refusing to skip patch"
               )
 
           source = target.read_text()
@@ -297,41 +489,38 @@ jobs:
               pattern,
               r'\1paramsList.add("tcp:127.0.0.1:5555,server=on,wait=off");',
               source,
-              count=1
+              count=1,
           )
 
           if count != 1:
               raise SystemExit("Serial patch did not apply exactly once")
 
           target.write_text(updated)
-          print("Serial backend patched:", target)
+          print("Serial backend configured:", target)
           PY
 
-      - name: Apply optional Scorpion overlay
+      - name: Apply Scorpion Android overlay
         shell: bash
         working-directory: ${{ runner.temp }}/limbo
         run: |
-          set -e
+          set -euxo pipefail
 
           if [ -d "$GITHUB_WORKSPACE/scorp-overlay" ]; then
             cp -a "$GITHUB_WORKSPACE/scorp-overlay/." .
             echo "Scorpion overlay applied."
           else
-            echo "No scorp-overlay directory; using existing Limbo UI."
+            echo "::notice::No scorp-overlay directory; generated Scorpion home screen will be used."
           fi
 
       - name: Build Android APK
         shell: bash
         working-directory: ${{ runner.temp }}/limbo
         run: |
-          set -e
+          set -euxo pipefail
           chmod +x ./gradlew
-          java -version
+          ./gradlew --no-daemon :limbo-android-arm:assembleDebug
 
-          ./gradlew --no-daemon \
-            :limbo-android-arm:assembleDebug
-
-      - name: Collect APK and diagnostics
+      - name: Collect APK and build logs
         if: always()
         shell: bash
         run: |
@@ -339,15 +528,14 @@ jobs:
 
           if [ -d "$RUNNER_TEMP/limbo" ]; then
             find "$RUNNER_TEMP/limbo" -type f -name '*.apk' \
-              -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; \
+              -exec cp -n {} "$GITHUB_WORKSPACE/artifacts/" \; \
               2>/dev/null || true
           fi
 
-          for log in qemu-build.log; do
-            if [ -f "$RUNNER_TEMP/$log" ]; then
-              cp "$RUNNER_TEMP/$log" "$GITHUB_WORKSPACE/artifacts/"
-            fi
-          done
+          if [ -f "$RUNNER_TEMP/qemu-build.log" ]; then
+            cp "$RUNNER_TEMP/qemu-build.log" \
+              "$GITHUB_WORKSPACE/artifacts/"
+          fi
 
           ls -lh "$GITHUB_WORKSPACE/artifacts" || true
 
@@ -355,7 +543,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scorp-android-arm32
+          name: scorpion-emulator-arm32
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14
